@@ -74,7 +74,6 @@ namespace ttrcrwm
                 var thruster = entity as IMyThrust;
                 if (thruster != null)
                 {
-                    log_grid_action("on_block_added", thruster.BlockDefinition.SubtypeName);
                     if (_ECU == null)
                         _ECU = new engine_control_unit(_grid);
                     _ECU.assign_thruster(thruster);
