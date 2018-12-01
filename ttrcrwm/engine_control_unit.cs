@@ -1,13 +1,11 @@
 ﻿using System;
 using System.Collections.Generic;
 
-using Sandbox.Common.ObjectBuilders;
-using Sandbox.Definitions;
 using Sandbox.Game.Entities;
 using Sandbox.ModAPI;
-using Sandbox.ModAPI.Interfaces;
 using VRage.Game;
 using VRage.Game.Components;
+using VRage.Game.Entity;
 using VRage.Game.ModAPI;
 using VRage.Utils;
 using VRageMath;
@@ -34,7 +32,6 @@ namespace ttrcrwm
         private static float[] __control_vector     = new float[6];
         private static float[] __actual_force       = new float[6];
         private static float[] __linear_component   = new float[6];
-        //private static float[] __braking_vector    = new float[6];
         private static float[] __thrust_vector      = new float[6];
         private static float[] __braking_vector     = new float[6];
         private static float[] __cur_firing_vector  = new float[6];
@@ -85,6 +82,8 @@ namespace ttrcrwm
         private Vector3[] _rotation_samples = new Vector3[NUM_ROTATION_SAMPLES];
         private Vector3   _sample_sum       = Vector3.Zero;
         private int       _current_index    = 0, _physics_enable_delay = PHYSICS_ENABLE_DELAY;
+
+        private MyEntity _match_velocity_with = null;
 
         #endregion
 
@@ -257,7 +256,7 @@ namespace ttrcrwm
             */
             if (_physics_enable_delay > 0)
                 --_physics_enable_delay;
-            else if (torque.LengthSquared() > MIN_ANGULAR_ACCELERATION * MIN_ANGULAR_ACCELERATION * _spherical_moment_of_inertia * _spherical_moment_of_inertia)
+            else if (useful_torque.LengthSquared() > MIN_ANGULAR_ACCELERATION * MIN_ANGULAR_ACCELERATION * _spherical_moment_of_inertia * _spherical_moment_of_inertia)
             {
                 torque = Vector3.Transform(useful_torque, _grid.WorldMatrix.GetOrientation());
                 _grid.Physics.AddForce(MyPhysicsForceType.APPLY_WORLD_IMPULSE_AND_WORLD_ANGULAR_IMPULSE, Vector3.Zero, null, torque);
@@ -429,8 +428,6 @@ namespace ttrcrwm
                 {
                     cur_thruster_info = cur_thruster.Value;
                     thruster_entry    = cur_thruster.Key;
-                    //if (cur_thruster_info.is_RCS)
-                    //    cur_thruster_info.override_cleared = false;
                     if (!thruster_entry.ShowInTerminal)
                         __is_override_active[(int) cur_thruster_info.nozzle_direction] |= thruster_entry.ThrustOverride >= 1.0f;
                 }
@@ -439,7 +436,12 @@ namespace ttrcrwm
             Matrix inverse_world_rotation   = _inverse_world_transform.GetOrientation();
             _local_angular_velocity         = Vector3.Transform(_grid.Physics.AngularVelocity, inverse_world_rotation);
             float   manual_rotation_length2 = _manual_rotation.LengthSquared();
-            Vector3 desirted_angular_velocity, local_linear_velocity = Vector3.Transform(_grid.Physics.LinearVelocity, inverse_world_rotation);
+
+            Vector3 world_linear_velocity   = _grid.Physics.LinearVelocity;
+            if (_match_velocity_with?.Physics != null)
+                world_linear_velocity -= _match_velocity_with.Physics.LinearVelocity;
+
+            Vector3 desirted_angular_velocity, local_linear_velocity = Vector3.Transform(world_linear_velocity, inverse_world_rotation);
             if (manual_rotation_length2 <= 0.0001f)
                 desirted_angular_velocity = -_local_angular_velocity;
             else
@@ -463,38 +465,11 @@ namespace ttrcrwm
             }
             decompose_vector(desirted_angular_velocity, __control_vector);
             decompose_vector(    local_linear_velocity, __linear_velocity);
-            /*
-            float min_control      = (!linear_dampers_on || local_linear_velocity.LengthSquared() <= 1.0f) ? 0.02f : 0.3f,
-                longitudinal_speed = __linear_velocity[(int) thrust_dir.fore  ] + __linear_velocity[(int) thrust_dir.aft      ],
-                     lateral_speed = __linear_velocity[(int) thrust_dir.port  ] + __linear_velocity[(int) thrust_dir.starboard],
-                    vertical_speed = __linear_velocity[(int) thrust_dir.dorsal] + __linear_velocity[(int) thrust_dir.ventral  ];
-            bool pitch_control_on = __control_vector[(int) thrust_dir.port  ] + __control_vector[(int) thrust_dir.starboard] >= min_control,
-                   yaw_control_on = __control_vector[(int) thrust_dir.dorsal] + __control_vector[(int) thrust_dir.ventral  ] >= min_control,
-                  roll_control_on = __control_vector[(int) thrust_dir.fore  ] + __control_vector[(int) thrust_dir.aft      ] >= min_control;
-            __rotation_enable[(int) thrust_dir.fore  ] = __rotation_enable[(int) thrust_dir.aft      ] = pitch_control_on || yaw_control_on  || longitudinal_speed <= 1.0f;
-            __rotation_enable[(int) thrust_dir.port  ] = __rotation_enable[(int) thrust_dir.starboard] =   yaw_control_on || roll_control_on ||      lateral_speed <= 1.0f;
-            __rotation_enable[(int) thrust_dir.dorsal] = __rotation_enable[(int) thrust_dir.ventral  ] = pitch_control_on || roll_control_on ||     vertical_speed <= 1.0f;
-            */
 
-            Vector3 linear_damping;
-            if (!linear_dampers_on)
-                linear_damping = /*linear_damping =*/ Vector3.Zero;
-            else
-            {
-                linear_damping = Vector3.Transform((2.0f *_grid.Physics.LinearVelocity + _grid.Physics.Gravity) * (-_grid.Physics.Mass), inverse_world_rotation);
-                //linear_damping      = (-2.0f * _grid.Physics.Mass) * Vector3.Transform(_grid.Physics.LinearVelocity, inverse_world_rotation);
-            }
-            //decompose_vector(      linear_damping, __braking_vector );
+            Vector3 linear_damping = !linear_dampers_on ? Vector3.Zero : Vector3.Transform((2.0f * world_linear_velocity + _grid.Physics.Gravity) * (-_grid.Physics.Mass), inverse_world_rotation);
             decompose_vector(_manual_thrust, __thrust_vector );
             decompose_vector(linear_damping, __braking_vector);
 
-            /*
-            for (int dir_index = 0; dir_index < 6; ++dir_index)
-            {
-                if (_lin_force[dir_index] >= 1.0f)
-                    __thrust_vector[dir_index] += __braking_vector[dir_index] / _lin_force[dir_index];
-            }
-            */
             for (int dir_index = 0; dir_index < 6; ++dir_index)
             {
                 int opposite_dir = dir_index % 3;
@@ -650,13 +625,6 @@ namespace ttrcrwm
                         changes_made             = true;
                         __thrusters_to_move.Add(cur_thruster.Key);
                     }
-                    /*
-                    if (!cur_thruster_info.is_RCS && !cur_thruster_info.override_cleared)
-                    {
-                        cur_thruster.Key.ThrustOverride    = 0.0f;
-                        cur_thruster_info.override_cleared = changes_made = true;
-                    }
-                    */
                 }
                 if (dir_index < 6)
                 {
@@ -797,7 +765,6 @@ namespace ttrcrwm
                 }
             }
 
-            //_max_force[(int) new_thruster.nozzle_direction] += new_thruster.max_force;
             _lin_force[(int) new_thruster.nozzle_direction] += new_thruster.actual_max_force;
             _thrusters[(int)       thrust_dir.uncontrolled].Add(thruster, new_thruster);
             //log_ECU_action("assign_thruster", string.Format("{0} ({1}) [{2}]\n\t\t\tCentre position: {3}",
@@ -927,8 +894,6 @@ namespace ttrcrwm
 
         public void check_autopilot(IMyRemoteControl RC_block)
         {
-            //var RC_block_proper = (MyRemoteControl) RC_block;
-            //autopilot_on       |= ((MyObjectBuilder_RemoteControl) RC_block_proper.GetObjectBuilderCubeBlock()).AutoPilotEnabled;
             autopilot_on |= RC_block.IsAutoPilotEnabled;
         }
 
@@ -951,6 +916,8 @@ namespace ttrcrwm
             controller.Orientation.GetMatrix(out cockpit_matrix);
             _manual_thrust        = Vector3.Clamp(Vector3.Transform(input_thrust, cockpit_matrix), -Vector3.One, Vector3.One);
             _under_player_control = true;
+
+            _match_velocity_with = ((Sandbox.Game.Entities.IMyControllableEntity) current_controller).RelativeDampeningEntity;
         }
 
         public void translate_rotation_input(Vector3 input_rotation, VRage.Game.ModAPI.Interfaces.IMyControllableEntity current_controller)
