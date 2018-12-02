@@ -56,7 +56,16 @@ namespace ttrcrwm
             new Dictionary<IMyThrust, thruster_info>(),   // ventral
             new Dictionary<IMyThrust, thruster_info>()    // uncontrolled
         };
-        private HashSet<thruster_info>[] _control_sets =
+        private HashSet<thruster_info>[] _control_sets_pos =
+        {
+            new HashSet<thruster_info>(),   // roll clockwise
+            new HashSet<thruster_info>(),   // pitch down
+            new HashSet<thruster_info>(),   // yaw right
+            new HashSet<thruster_info>(),   // roll counter-clockwise
+            new HashSet<thruster_info>(),   // pitch up
+            new HashSet<thruster_info>()    // yaw left
+        };
+        private HashSet<thruster_info>[] _control_sets_neg =
         {
             new HashSet<thruster_info>(),   // roll clockwise
             new HashSet<thruster_info>(),   // pitch down
@@ -286,6 +295,8 @@ namespace ttrcrwm
 
         private void fill_control_sets(thruster_info cur_thruster_info)
         {
+            const float MIN_LEVERAGE = 0.01f;
+
             if (cur_thruster_info.reference_vector.LengthSquared() < _grid.GridSize * _grid.GridSize)
                 return;
 
@@ -295,8 +306,10 @@ namespace ttrcrwm
                 __cur_firing_vector[dir_index] = 1.0f;
                 recompose_vector(__cur_firing_vector, out sample_vector);
                 decompose_vector(Vector3.Cross(sample_vector, reference_norm), __linear_component);
-                if (__linear_component[(int) cur_thruster_info.nozzle_direction] > 0.0f)
-                    _control_sets[dir_index].Add(cur_thruster_info);
+                if (__linear_component[(int) cur_thruster_info.nozzle_direction] > MIN_LEVERAGE)
+                    _control_sets_pos[dir_index].Add(cur_thruster_info);
+                else if (__linear_component[((int) cur_thruster_info.nozzle_direction + 3) % 6] > MIN_LEVERAGE)
+                    _control_sets_neg[dir_index].Add(cur_thruster_info);
                 __cur_firing_vector[dir_index] = 0.0f;
             }
         }
@@ -304,7 +317,10 @@ namespace ttrcrwm
         private void refresh_control_sets()
         {
             for (int dir_index = 0; dir_index < 6; ++dir_index)
-                _control_sets[dir_index].Clear();
+            {
+                _control_sets_pos[dir_index].Clear();
+                _control_sets_neg[dir_index].Clear();
+            }
             for (int dir_index = 0; dir_index < 6; ++dir_index)
             {
                 foreach (var cur_thruster_info in _thrusters[dir_index].Values)
@@ -316,7 +332,7 @@ namespace ttrcrwm
         {
             const float MIN_OVERRIDE = 1.001f;
 
-            float         setting, setting_ratio;
+            float         setting;
             bool          dry_run;
             thruster_info cur_thruster_info;
             IMyThrust     thruster_entry;
@@ -363,14 +379,7 @@ namespace ttrcrwm
                     setting = cur_thruster_info.current_setting * cur_thruster_info.max_force;
                     if (_rotation_active && dir_index < 6 && setting < MIN_OVERRIDE)
                         setting = MIN_OVERRIDE;
-                    if (setting >= 1.0f)
-                        setting_ratio = cur_thruster_info.prev_setting / setting;
-                    else
-                    {
-                        setting_ratio = (cur_thruster_info.prev_setting >= 1.0f) ? 0.0f : 1.0f;
-                        setting       = 0.0f;
-                    }
-                    if (setting_ratio <= 0.99f || setting_ratio >= 1.01f)
+                    if (setting != cur_thruster_info.prev_setting)
                     {
                         if (!dry_run)
                             thruster_entry.ThrustOverride = setting;
@@ -397,15 +406,17 @@ namespace ttrcrwm
                 foreach (var cur_thruster_info in _thrusters[opposite_dir].Values)
                     opposite_force += cur_thruster_info.current_setting * cur_thruster_info.actual_max_force;
 
-                if (current_force >= 1.0f && current_force - __braking_vector[dir_index] > opposite_force)
+                float force1 = __braking_vector[   dir_index] + __thrust_vector[   dir_index] * _lin_force[   dir_index];
+                float force2 = __braking_vector[opposite_dir] + __thrust_vector[opposite_dir] * _lin_force[opposite_dir];
+                if (current_force >= 1.0f && current_force - force1 > opposite_force)
                 {
-                    new_force_ratio = (opposite_force + __braking_vector[dir_index]) / current_force;
+                    new_force_ratio = (opposite_force + force1) / current_force;
                     foreach (var cur_thruster_info in _thrusters[dir_index].Values)
                         cur_thruster_info.current_setting *= new_force_ratio;
                 }
-                if (opposite_force >= 1.0f && opposite_force - __braking_vector[opposite_dir] > current_force)
+                if (opposite_force >= 1.0f && opposite_force - force2 > current_force)
                 {
-                    new_force_ratio = (current_force + __braking_vector[opposite_dir]) / opposite_force;
+                    new_force_ratio = (current_force + force2) / opposite_force;
                     foreach (var cur_thruster_info in _thrusters[opposite_dir].Values)
                         cur_thruster_info.current_setting *= new_force_ratio;
                 }
@@ -470,23 +481,26 @@ namespace ttrcrwm
             decompose_vector(_manual_thrust, __thrust_vector );
             decompose_vector(linear_damping, __braking_vector);
 
+            for (int dir_index = 0; dir_index < 3; ++dir_index)
+            {
+                int opposite_dir = dir_index + 3;
+
+                if (__thrust_vector[dir_index] >= MAX_THRUST_LEVEL || __thrust_vector[opposite_dir] >= MAX_THRUST_LEVEL)
+                    __braking_vector[dir_index] = __braking_vector[opposite_dir] = 0.0f;
+            }
             for (int dir_index = 0; dir_index < 6; ++dir_index)
             {
-                int opposite_dir = dir_index % 3;
+                int opposite_dir = (dir_index + 3) % 6;
 
-                if (            _RCS_control[dir_index]
-                    && !__is_override_active[dir_index]                    && !__is_override_active[opposite_dir] 
-                    &&       __thrust_vector[dir_index] < MAX_THRUST_LEVEL &&       __thrust_vector[opposite_dir] < MAX_THRUST_LEVEL)
-                {
-                    __initial_setting[dir_index] = (_max_force[dir_index] >= 1.0f && _lin_force[dir_index] >= 1.0f) ? (__braking_vector[dir_index] / _lin_force[dir_index]) : 0.0f;
-                }
+                if (_RCS_control[dir_index] && !__is_override_active[dir_index] && !__is_override_active[opposite_dir]) 
+                    __initial_setting[dir_index] = (_max_force[dir_index] >= 1.0f && _lin_force[dir_index] >= 1.0f) ? (__thrust_vector[dir_index] + __braking_vector[dir_index] / _lin_force[dir_index]) : 0.0f;
                 else
                     __initial_setting[dir_index] = 0.0f;
                 if (__initial_setting[dir_index] > 1.0f)
                     __initial_setting[dir_index] = 1.0f;
 
                 foreach (var cur_thruster_info in _thrusters[dir_index].Values)
-                    cur_thruster_info.current_setting = 0.0f;
+                    cur_thruster_info.current_setting = __initial_setting[dir_index];
             }
             foreach (var cur_thruster_info in _thrusters[(int) thrust_dir.uncontrolled].Values)
                 cur_thruster_info.current_setting = __initial_setting[(int) cur_thruster_info.nozzle_direction];
@@ -496,11 +510,17 @@ namespace ttrcrwm
 
                 for (int thruster_dir = 0; thruster_dir < 6; ++thruster_dir)
                     __settings[thruster_dir] = (_max_force[thruster_dir] >= 1.0f) ? (control / _max_force[thruster_dir]) : 0.0f;
-                foreach (var cur_thruster_info in _control_sets[dir_index])
+                foreach (var cur_thruster_info in _control_sets_pos[dir_index])
                 {
                     cur_thruster_info.current_setting += __settings[(int) cur_thruster_info.nozzle_direction];
                     if (cur_thruster_info.current_setting > 1.0f)
                         cur_thruster_info.current_setting = 1.0f;
+                }
+                foreach (var cur_thruster_info in _control_sets_neg[dir_index])
+                {
+                    cur_thruster_info.current_setting -= __settings[(int) cur_thruster_info.nozzle_direction];
+                    if (cur_thruster_info.current_setting < 0.0f)
+                        cur_thruster_info.current_setting = 0.0f;
                 }
             }
 
